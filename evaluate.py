@@ -72,27 +72,51 @@ TESTSET: list[tuple[str, str, str]] = [
     ("SELECT * FROM orders LIMIT 400000, 10", "R8", "深分页9"),
 ]
 
+# 规则盲区样本：组合条件中某列缺索引、被另一列的索引"掩盖"，规则引擎因 EXPLAIN 未出现全表扫描而漏判。
+# 这些场景真实存在，规则引擎返回 NONE（需 LLM 兜底），构成评测的"坏样本"。
+BLIND_TESTSET: list[tuple[str, str, str]] = [
+    ("SELECT * FROM orders WHERE status='paid' AND amount>5000", "R1", "组合缺索引：status 有索引掩盖 amount 无索引"),
+    ("SELECT * FROM orders WHERE status='shipped' AND user_id=12345", "R1", "组合缺索引：status 有索引掩盖 user_id 无索引"),
+    ("SELECT * FROM orders WHERE create_time > '2026-09-01' AND amount>5000", "R1", "组合缺索引：create_time 有索引掩盖 amount 无索引"),
+    ("SELECT * FROM orders WHERE status='done' AND remark='hello'", "R1", "组合缺索引：status 有索引掩盖 remark 无索引"),
+    ("SELECT * FROM orders WHERE status='paid' AND amount BETWEEN 100 AND 200", "R1", "组合缺索引：status 有索引掩盖 amount 范围"),
+    ("SELECT * FROM orders WHERE status='pending' AND user_id IN (1,2,3)", "R1", "组合缺索引：status 有索引掩盖 user_id IN"),
+]
+
 
 def run_accuracy(allow_llm: bool = False) -> float:
-    """跑诊断命中率（默认纯规则，token=0）。"""
+    """跑诊断命中率（默认纯规则，token=0）。
+
+    分两层统计：
+    - 规则正面样本（TESTSET，50 条常见慢查询，规则能判定）—— 期望规则命中；
+    - 规则盲区样本（BLIND_TESTSET，6 条组合缺索引，规则漏判需 LLM 兜底）—— 记录规则漏判。
+    """
     conn = get_conn()
     _drop_extra_indexes(conn)  # 清理业务索引，保证评测在"缺索引"干净状态、可复现
-    hit = 0
-    misses = []
-    for sql, expected, note in TESTSET:
-        r = diagnose_sql(sql, conn=conn, allow_llm=allow_llm)
-        predicted = r.matched_rules[0] if r.matched_rules else "NONE"
-        if predicted == expected:
-            hit += 1
-        else:
-            misses.append((sql, expected, predicted, r.root_cause))
-    conn.close()
 
-    total = len(TESTSET)
-    acc = hit / total
-    print(f"诊断命中率：{hit}/{total} = {acc * 100:.1f}%")
-    for sql, expected, predicted, cause in misses:
-        print(f"  [MISS] 期望 {expected} 实得 {predicted} | {sql[:55]}")
+    def _run_one(subset, label):
+        hit = 0
+        misses = []
+        for sql, expected, note in subset:
+            r = diagnose_sql(sql, conn=conn, allow_llm=allow_llm)
+            predicted = r.matched_rules[0] if r.matched_rules else "NONE"
+            if predicted == expected:
+                hit += 1
+            else:
+                misses.append((sql, expected, predicted, r.root_cause))
+        print(f"\n[{label}] 命中 {hit}/{len(subset)} = {hit / len(subset) * 100:.1f}%")
+        for sql, expected, predicted, cause in misses:
+            print(f"  [MISS] 期望 {expected} 实得 {predicted} | {sql[:55]}")
+        return hit, misses
+
+    rule_hit, _rule_miss = _run_one(TESTSET, "规则正面样本（50 条常见慢查询）")
+    blind_hit, blind_miss = _run_one(BLIND_TESTSET, "规则盲区样本（6 条组合缺索引）")
+
+    conn.close()
+    total = len(TESTSET) + len(BLIND_TESTSET)
+    acc = (rule_hit + blind_hit) / total
+    print(f"\n总命中率：{rule_hit + blind_hit}/{total} = {acc * 100:.1f}%"
+          f"（其中盲区样本 {len(blind_miss)} 条规则漏判，需 LLM 兜底）")
     return acc
 
 
